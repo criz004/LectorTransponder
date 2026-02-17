@@ -1,12 +1,19 @@
 import socket
 import pyodbc
 import time
+import json
+import requests
+import threading
 from datetime import datetime
 
 # --- CONFIGURACIÓN ---
-HOST = 'localhost'
-PORT = 30003
-TIEMPO_EXPIRACION = 60  # 600 segundos (10 minutos). Si no actualiza en este tiempo, se borra.
+HOST_SBS = 'localhost' # Puerto 30003 (Eventos)
+PORT_SBS = 30003
+
+# URL del JSON (Fuente de Calidad para Lat/Lon/Track)
+URL_JSON = "http://172.17.18.233/tar1090/data/aircraft.json" 
+
+TIEMPO_EXPIRACION = 60  # 1 min
 
 # --- CONFIGURACIÓN DE PISTAS (POLÍGONOS EXACTOS) ---
 PISTAS_POLIGONOS = {
@@ -34,9 +41,67 @@ def get_db_connection():
         'PWD=CIRUM/*4dm1n1str4t0r2026'
     )
 
-# Memoria para comparar estados
-# Clave: HexIdent | Valor: { 'gnd': bool, 'alt': int, 'estado_actual': str, 'last_seen': timestamp }
-memoria_aviones = {}
+# --- MEMORIA GLOBAL ---
+memoria_aviones = {} 
+cache_json_data = {} 
+
+# --- HILO DE ACTUALIZACIÓN JSON (BACKGROUND) ---
+def worker_actualizar_json():
+    """Consulta el aircraft.json cada segundo con LÓGICA DE PRIORIDAD DE RUMBO"""
+    global cache_json_data
+    while True:
+        try:
+            response = requests.get(URL_JSON, timeout=2)
+            if response.status_code == 200:
+                data = response.json()
+                aircraft_list = data.get('aircraft', [])
+                
+                temp_cache = {}
+                for avion in aircraft_list:
+                    hex_code = avion.get('hex', '').upper()
+                    if hex_code:
+                        # 1. SANITIZACIÓN DE ALTITUD (FIX "ground")
+                        raw_alt = avion.get('alt_baro')
+                        if raw_alt is None: raw_alt = avion.get('alt_geom')
+                        
+                        final_alt = None
+                        if str(raw_alt).lower() == 'ground':
+                            final_alt = 0
+                        else:
+                            try: final_alt = int(float(raw_alt))
+                            except: final_alt = None
+
+                        # 2. SANITIZACIÓN DE RUMBO (FIX true_heading vs track)
+                        # Prioridad: true_heading (nariz) > track (movimiento)
+                        raw_heading = avion.get('true_heading')
+                        if raw_heading is None:
+                            raw_heading = avion.get('track')
+                        
+                        final_track = None
+                        try: final_track = int(float(raw_heading))
+                        except: final_track = None
+
+                        # 3. VELOCIDAD (gs)
+                        final_speed = None
+                        try: final_speed = int(float(avion.get('gs', 0)))
+                        except: final_speed = None
+
+                        temp_cache[hex_code] = {
+                            'lat': avion.get('lat'),
+                            'lon': avion.get('lon'),
+                            'track': final_track, # Aquí ya va el mejor valor posible
+                            'alt': final_alt, 
+                            'speed': final_speed,
+                            'squawk': avion.get('squawk'),
+                            'flight': avion.get('flight', '').strip()
+                        }
+                
+                cache_json_data = temp_cache
+            
+        except Exception as e:
+            print(f"⚠️ Error leyendo JSON: {e}")
+        
+        time.sleep(1) 
 
 # --- FUNCIONES DE GEOMETRÍA ---
 def punto_en_poligono(lat, lon, poligono):
@@ -65,122 +130,110 @@ def identificar_pista(lat, lon):
 # --- FUNCIONES DE LÓGICA ---
 def analizar_squawk(squawk, hex_id):
     if squawk == '7700':
-        print(f"🚨 ALERTA ROJA: Emergencia General en {hex_id} (Squawk 7700)")
+        print(f"🚨 ALERTA ROJA: Emergencia General en {hex_id}")
         return 'EMERGENCIA'
     elif squawk == '7600':
-        print(f"📻 ALERTA: Falla de Radio en {hex_id} (Squawk 7600)")
         return 'FALLA_RADIO'
     elif squawk == '7500':
-        print(f"☠️ ALERTA CRÍTICA: Secuestro en {hex_id} (Squawk 7500)")
         return 'SECUESTRO'
     return None
 
 def limpiar_inactivos(cursor):
-    """Elimina aviones viejos de la DB y de la Memoria Python"""
-    # 1. Limpieza en SQL Server
     try:
-        # Borramos registros que no se han actualizado en TIEMPO_EXPIRACION segundos
-        query_clean = f"""
-        DELETE FROM dbo.EstadoAeropuerto 
-        WHERE DATEDIFF(second, UltimaActualizacion, GETDATE()) > {TIEMPO_EXPIRACION}
-        """
+        query_clean = f"DELETE FROM dbo.EstadoAeropuerto WHERE DATEDIFF(second, UltimaActualizacion, GETDATE()) > {TIEMPO_EXPIRACION}"
         cursor.execute(query_clean)
-        deleted_count = cursor.rowcount
         cursor.commit()
         
-        if deleted_count > 0:
-            print(f"🧹 Limpieza: Se eliminaron {deleted_count} aviones inactivos de la BD.")
-
-        # 2. Limpieza en Memoria Python
         ahora = time.time()
-        # Creamos una lista de las llaves para poder borrar mientras iteramos
-        aviones_a_borrar = [k for k, v in memoria_aviones.items() if (ahora - v['last_seen']) > TIEMPO_EXPIRACION]
-        
-        for hex_id in aviones_a_borrar:
-            del memoria_aviones[hex_id]
-            
+        borrar = [k for k, v in memoria_aviones.items() if (ahora - v['last_seen']) > TIEMPO_EXPIRACION]
+        for k in borrar: del memoria_aviones[k]
     except Exception as e:
-        print(f"⚠️ Error en limpieza: {e}")
+        pass # Silencioso para no ensuciar consola
 
 def main():
+    t_json = threading.Thread(target=worker_actualizar_json, daemon=True)
+    t_json.start()
+    print("🌍 Hilo JSON iniciado (Fuente primaria de GPS/Track/Heading)")
+
     conn = get_db_connection()
     cursor = conn.cursor()
     
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    
-    # Variable para controlar cada cuánto ejecutamos la limpieza
     ultima_limpieza = time.time()
 
     try:
-        s.connect((HOST, PORT))
-        print("🕵️ Monitor de Operaciones...")
+        s.connect((HOST_SBS, PORT_SBS))
+        print(f"🔌 Conectado a SBS-1 ({HOST_SBS}:{PORT_SBS}) para eventos...")
         
         buffer_socket = ""
         while True:
-            # --- RUTINA DE LIMPIEZA (Cada 60 segundos) ---
             if time.time() - ultima_limpieza > 60:
                 limpiar_inactivos(cursor)
                 ultima_limpieza = time.time()
 
             try:
                 data = s.recv(4096).decode('utf-8')
-            except socket.timeout:
-                continue
-            except socket.error:
-                print("Reconectando...")
+            except:
+                print("Reconectando socket...")
                 time.sleep(5)
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.connect((HOST, PORT))
+                s.connect((HOST_SBS, PORT_SBS))
                 continue
 
             buffer_socket += data
-            
             while "\n" in buffer_socket:
                 line, buffer_socket = buffer_socket.split("\n", 1)
                 fields = line.split(',')
                 
                 if len(fields) < 22 or fields[0] != 'MSG': continue
 
-                hex_id = fields[4].strip()
-                callsign = fields[10].strip() or None
+                hex_id = fields[4].strip().upper()
                 
-                try:
-                    alt = int(fields[11]) if fields[11].strip() else None
-                    spd = int(fields[12]) if fields[12].strip() else None
-                    track = int(fields[13]) if fields[13].strip() else None
-                    lat = float(fields[14]) if fields[14].strip() else None
-                    lon = float(fields[15]) if fields[15].strip() else None
-                    sq = fields[17].strip() or None
-                    on_gnd = True if fields[21].strip() != '0' else False
-                except ValueError:
-                    continue 
+                # DATOS SBS (Eventos inmediatos)
+                raw_callsign = fields[10].strip() or None
+                raw_on_gnd = True if fields[21].strip() != '0' else False
+                
+                # DATOS JSON (Calidad GPS + Rumbo)
+                json_info = cache_json_data.get(hex_id, {})
+                
+                lat = json_info.get('lat')
+                lon = json_info.get('lon')
+                track = json_info.get('track') # Ahora este trae true_heading si existe
+                alt = json_info.get('alt')
+                speed = json_info.get('speed')
+                squawk = json_info.get('squawk')
+                callsign = json_info.get('flight') or raw_callsign
+
+                # Fallbacks si el JSON aún no tiene al avión pero el socket sí
+                if lat is None and fields[14].strip(): lat = float(fields[14])
+                if lon is None and fields[15].strip(): lon = float(fields[15])
+                if track is None and fields[13].strip(): track = int(fields[13])
+                if alt is None and fields[11].strip(): 
+                     try: alt = int(fields[11])
+                     except: pass
 
                 # LÓGICA DE NEGOCIO
                 nuevo_estado = None
-                pista_actual = None
-                
-                if sq:
-                    estado_emergencia = analizar_squawk(sq, hex_id)
-                    if estado_emergencia: nuevo_estado = estado_emergencia
-
                 pista_actual = identificar_pista(lat, lon)
+                
+                if squawk:
+                    emergencia = analizar_squawk(str(squawk), hex_id)
+                    if emergencia: nuevo_estado = emergencia
 
                 if not nuevo_estado and hex_id in memoria_aviones:
                     prev = memoria_aviones[hex_id]
-                    if prev['gnd'] == False and on_gnd == True:
+                    if prev['gnd'] == False and raw_on_gnd == True:
                         nuevo_estado = 'EN_TIERRA'
-                        pista_msg = f" en Pista {pista_actual}" if pista_actual else ""
-                        print(f"🛬 ATERRIZAJE: {callsign or hex_id}{pista_msg}")
-                    elif prev['gnd'] == True and on_gnd == False and (alt is not None and alt > 200):
+                        print(f"🛬 ATERRIZAJE: {callsign or hex_id} [Pista: {pista_actual or '?'}]")
+                    elif prev['gnd'] == True and raw_on_gnd == False and (alt is not None and alt > 200):
                         nuevo_estado = 'EN_VUELO'
-                        pista_msg = f" de Pista {pista_actual}" if pista_actual else ""
-                        print(f"🛫 DESPEGUE: {callsign or hex_id}{pista_msg}")
+                        print(f"🛫 DESPEGUE: {callsign or hex_id} [Pista: {pista_actual or '?'}]")
 
                 if not nuevo_estado:
                     nuevo_estado = memoria_aviones.get(hex_id, {}).get('estado_actual', 'EN_VUELO')
-                    if on_gnd: nuevo_estado = 'EN_TIERRA' 
+                    if raw_on_gnd: nuevo_estado = 'EN_TIERRA'
 
-                # UPSERT BASE DE DATOS
+                # UPSERT
                 if lat is not None or nuevo_estado != 'EN_VUELO':
                     query = """
                     MERGE dbo.EstadoAeropuerto AS target
@@ -206,22 +259,23 @@ def main():
                     """
                     cursor.execute(query, (
                         hex_id, callsign,
-                        callsign, nuevo_estado, lat, lon, track, spd, alt, sq, pista_actual, nuevo_estado, nuevo_estado,
-                        nuevo_estado, lat, lon, track, spd, alt, sq, pista_actual, nuevo_estado
+                        callsign, nuevo_estado, lat, lon, track, speed, alt, squawk, pista_actual, nuevo_estado, nuevo_estado,
+                        nuevo_estado, lat, lon, track, speed, alt, squawk, pista_actual, nuevo_estado
                     ))
                     conn.commit()
 
-                # ACTUALIZAR MEMORIA (Incluyendo last_seen para la limpieza)
                 memoria_aviones[hex_id] = {
-                    'gnd': on_gnd, 
-                    'alt': alt, 
+                    'gnd': raw_on_gnd,
+                    'alt': alt,
                     'estado_actual': nuevo_estado,
-                    'last_seen': time.time() # ¡Importante para la limpieza!
+                    'last_seen': time.time()
                 }
 
+    except KeyboardInterrupt:
+        print("\n🛑 Cerrando monitor...")
     except Exception as e:
-        print(f"❌ Error crítico: {e}")
-        time.sleep(5) 
+        print(f"❌ Error crítico Main: {e}")
+        time.sleep(5)
 
 if __name__ == "__main__":
     main()
