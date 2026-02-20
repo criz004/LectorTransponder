@@ -11,7 +11,7 @@ HOST_SBS = 'localhost' # Puerto 30003 (Eventos)
 PORT_SBS = 30003
 
 # URL del JSON (Fuente de Calidad para Lat/Lon/Track)
-URL_JSON = "http://172.17.18.233/tar1090/data/aircraft.json" 
+URL_JSON = "http://172.17.18.25/tar1090/data/aircraft.json" 
 
 TIEMPO_EXPIRACION = 60  # 1 min
 
@@ -34,11 +34,13 @@ PISTAS_POLIGONOS = {
 # --- CONEXIÓN DB ---
 def get_db_connection():
     return pyodbc.connect(
-        'DRIVER={ODBC Driver 17 for SQL Server};'
+        'DRIVER={FreeTDS};'
         'SERVER=172.16.2.125;'
         'DATABASE=DatosCIRUM;'
         'UID=admin_DB_DatosCIRUM;'
-        'PWD=CIRUM/*4dm1n1str4t0r2026'
+        'PWD=CIRUM/*4dm1n1str4t0r2026;'
+	'TDS_Version=7.4;'
+	'PORT=1433;'
     )
 
 # --- MEMORIA GLOBAL ---
@@ -151,21 +153,18 @@ def limpiar_inactivos(cursor):
         pass # Silencioso para no ensuciar consola
 
 def main():
-    t_json = threading.Thread(target=worker_actualizar_json, daemon=True)
-    t_json.start()
-    print("🌍 Hilo JSON iniciado (Fuente primaria de GPS/Track/Heading)")
+    threading.Thread(target=worker_actualizar_json, daemon=True).start()
+    print("🌍 Monitor Iniciado con ANTI-REBOTE (Delay 4s)")
 
     conn = get_db_connection()
     cursor = conn.cursor()
-    
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     ultima_limpieza = time.time()
 
     try:
         s.connect((HOST_SBS, PORT_SBS))
-        print(f"🔌 Conectado a SBS-1 ({HOST_SBS}:{PORT_SBS}) para eventos...")
-        
         buffer_socket = ""
+        
         while True:
             if time.time() - ultima_limpieza > 60:
                 limpiar_inactivos(cursor)
@@ -174,108 +173,113 @@ def main():
             try:
                 data = s.recv(4096).decode('utf-8')
             except:
-                print("Reconectando socket...")
                 time.sleep(5)
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.connect((HOST_SBS, PORT_SBS))
+                try: s.connect((HOST_SBS, PORT_SBS))
+                except: pass
                 continue
 
             buffer_socket += data
             while "\n" in buffer_socket:
                 line, buffer_socket = buffer_socket.split("\n", 1)
                 fields = line.split(',')
-                
                 if len(fields) < 22 or fields[0] != 'MSG': continue
 
                 hex_id = fields[4].strip().upper()
-                
-                # DATOS SBS (Eventos inmediatos)
+                ahora_ts = time.time()
+
+                # DATOS RAW
                 raw_callsign = fields[10].strip() or None
-                raw_on_gnd = True if fields[21].strip() != '0' else False
-                
-                # DATOS JSON (Calidad GPS + Rumbo)
+                fisico_en_tierra = True if fields[21].strip() != '0' else False
+
+                # DATOS JSON
                 json_info = cache_json_data.get(hex_id, {})
-                
-                lat = json_info.get('lat')
-                lon = json_info.get('lon')
-                track = json_info.get('track') # Ahora este trae true_heading si existe
+                lat = json_info.get('lat') or (float(fields[14]) if fields[14].strip() else None)
+                lon = json_info.get('lon') or (float(fields[15]) if fields[15].strip() else None)
+                track = json_info.get('track') or (int(fields[13]) if fields[13].strip() else None)
                 alt = json_info.get('alt')
                 speed = json_info.get('speed')
-                squawk = json_info.get('squawk')
+                squawk = json_info.get('squawk') or (fields[17].strip() if fields[17].strip() else None)
                 callsign = json_info.get('flight') or raw_callsign
 
-                # Fallbacks si el JSON aún no tiene al avión pero el socket sí
-                if lat is None and fields[14].strip(): lat = float(fields[14])
-                if lon is None and fields[15].strip(): lon = float(fields[15])
-                if track is None and fields[13].strip(): track = int(fields[13])
-                if alt is None and fields[11].strip(): 
-                     try: alt = int(fields[11])
-                     except: pass
-
-                # LÓGICA DE NEGOCIO
-                nuevo_estado = None
+                # --- CÁLCULO DE PISTA (CORRECCIÓN: SIEMPRE CALCULAR AQUÍ) ---
                 pista_actual = identificar_pista(lat, lon)
-                
+
+                # --- LÓGICA DE ANTI-REBOTE (DEBOUNCING) ---
+                if hex_id not in memoria_aviones:
+                    memoria_aviones[hex_id] = {
+                        'gnd_confirmado': fisico_en_tierra,
+                        'estado_candidato': fisico_en_tierra,
+                        'inicio_candidato': ahora_ts,
+                        'estado_logico': 'EN_TIERRA' if fisico_en_tierra else 'EN_VUELO',
+                        'last_seen': ahora_ts
+                    }
+
+                avion = memoria_aviones[hex_id]
+                avion['last_seen'] = ahora_ts
+
+                # Verificación de cambio de estado
+                if fisico_en_tierra != avion['gnd_confirmado']:
+                    if fisico_en_tierra == avion['estado_candidato']:
+                        tiempo_espera = ahora_ts - avion['inicio_candidato']
+                        
+                        if tiempo_espera > TIEMPO_CONFIRMACION:
+                            # ¡CONFIRMADO!
+                            avion['gnd_confirmado'] = fisico_en_tierra
+                            
+                            # Lógica de impresión de eventos
+                            if fisico_en_tierra:
+                                avion['estado_logico'] = 'EN_TIERRA'
+                                print(f"🛬 ATERRIZAJE CONFIRMADO: {callsign or hex_id} [Pista: {pista_actual or '?'}]")
+                            else:
+                                # Filtro extra de física para despegue
+                                if (alt and alt > 200) or (speed and speed > 100):
+                                    avion['estado_logico'] = 'EN_VUELO'
+                                    print(f"🛫 DESPEGUE CONFIRMADO: {callsign or hex_id} [Pista: {pista_actual or '?'}]")
+                                else:
+                                    avion['gnd_confirmado'] = True 
+                    else:
+                        avion['estado_candidato'] = fisico_en_tierra
+                        avion['inicio_candidato'] = ahora_ts
+                else:
+                    avion['estado_candidato'] = fisico_en_tierra
+                    avion['inicio_candidato'] = ahora_ts
+
+                # --- LÓGICA DE ESTADOS ESPECIALES ---
                 if squawk:
                     emergencia = analizar_squawk(str(squawk), hex_id)
-                    if emergencia: nuevo_estado = emergencia
+                    if emergencia: avion['estado_logico'] = emergencia
 
-                if not nuevo_estado and hex_id in memoria_aviones:
-                    prev = memoria_aviones[hex_id]
-                    if prev['gnd'] == False and raw_on_gnd == True:
-                        nuevo_estado = 'EN_TIERRA'
-                        print(f"🛬 ATERRIZAJE: {callsign or hex_id} [Pista: {pista_actual or '?'}]")
-                    elif prev['gnd'] == True and raw_on_gnd == False and (alt is not None and alt > 200):
-                        nuevo_estado = 'EN_VUELO'
-                        print(f"🛫 DESPEGUE: {callsign or hex_id} [Pista: {pista_actual or '?'}]")
-
-                if not nuevo_estado:
-                    nuevo_estado = memoria_aviones.get(hex_id, {}).get('estado_actual', 'EN_VUELO')
-                    if raw_on_gnd: nuevo_estado = 'EN_TIERRA'
-
-                # UPSERT
-                if lat is not None or nuevo_estado != 'EN_VUELO':
+                # --- DB UPDATE ---
+                estado_final = avion['estado_logico']
+                
+                # Ahora 'pista_actual' ya está definida arriba, así que no fallará
+                if lat is not None:
                     query = """
                     MERGE dbo.EstadoAeropuerto AS target
-                    USING (SELECT ? AS Hex, ? AS Call) AS source
-                    ON (target.HexIdent = source.Hex)
+                    USING (SELECT ? AS Hex) AS source ON (target.HexIdent = source.Hex)
                     WHEN MATCHED THEN
                         UPDATE SET 
                             Callsign = COALESCE(?, target.Callsign),
                             Estado = ?,
-                            Latitud = COALESCE(?, target.Latitud),
-                            Longitud = COALESCE(?, target.Longitud),
-                            Rumbo = COALESCE(?, target.Rumbo),
-                            Velocidad = COALESCE(?, target.Velocidad),
-                            Altitud = COALESCE(?, target.Altitud),
-                            Squawk = COALESCE(?, target.Squawk),
+                            Latitud = ?, Longitud = ?, Rumbo = ?, Velocidad = ?, Altitud = ?, Squawk = ?,
                             PistaProbable = COALESCE(?, target.PistaProbable),
                             HoraAterrizaje = CASE WHEN ? = 'EN_TIERRA' AND target.Estado <> 'EN_TIERRA' THEN GETDATE() ELSE target.HoraAterrizaje END,
                             HoraDespegue = CASE WHEN ? = 'EN_VUELO' AND target.Estado = 'EN_TIERRA' THEN GETDATE() ELSE target.HoraDespegue END,
                             UltimaActualizacion = GETDATE()
                     WHEN NOT MATCHED THEN
                         INSERT (HexIdent, Callsign, Estado, Latitud, Longitud, Rumbo, Velocidad, Altitud, Squawk, PistaProbable, HoraAterrizaje)
-                        VALUES (source.Hex, source.Call, ?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? = 'EN_TIERRA' THEN GETDATE() ELSE NULL END);
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? = 'EN_TIERRA' THEN GETDATE() ELSE NULL END);
                     """
                     cursor.execute(query, (
-                        hex_id, callsign,
-                        callsign, nuevo_estado, lat, lon, track, speed, alt, squawk, pista_actual, nuevo_estado, nuevo_estado,
-                        nuevo_estado, lat, lon, track, speed, alt, squawk, pista_actual, nuevo_estado
+                        hex_id, 
+                        callsign, estado_final, lat, lon, track, speed, alt, squawk, pista_actual, estado_final, estado_final,
+                        hex_id, callsign, estado_final, lat, lon, track, speed, alt, squawk, pista_actual, estado_final
                     ))
                     conn.commit()
 
-                memoria_aviones[hex_id] = {
-                    'gnd': raw_on_gnd,
-                    'alt': alt,
-                    'estado_actual': nuevo_estado,
-                    'last_seen': time.time()
-                }
-
-    except KeyboardInterrupt:
-        print("\n🛑 Cerrando monitor...")
-    except Exception as e:
-        print(f"❌ Error crítico Main: {e}")
-        time.sleep(5)
+    except KeyboardInterrupt: print("\n🛑 Fin.")
+    except Exception as e: print(f"❌ Error: {e}"); time.sleep(5)
 
 if __name__ == "__main__":
     main()
