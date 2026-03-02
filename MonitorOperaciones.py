@@ -1,3 +1,4 @@
+
 import socket
 import pyodbc
 import time
@@ -11,9 +12,10 @@ HOST_SBS = 'localhost' # Puerto 30003 (Eventos)
 PORT_SBS = 30003
 
 # URL del JSON (Fuente de Calidad para Lat/Lon/Track)
-URL_JSON = "http://172.17.18.25/tar1090/data/aircraft.json" 
+URL_JSON = "http://172.17.18.238/tar1090/data/aircraft.json" 
 
 TIEMPO_EXPIRACION = 60  # 1 min
+TIEMPO_CONFIRMACION = 4
 
 # --- CONFIGURACIÓN DE PISTAS (POLÍGONOS EXACTOS) ---
 PISTAS_POLIGONOS = {
@@ -91,11 +93,16 @@ def worker_actualizar_json():
                         temp_cache[hex_code] = {
                             'lat': avion.get('lat'),
                             'lon': avion.get('lon'),
-                            'track': final_track, # Aquí ya va el mejor valor posible
+                            'track': final_track, 
                             'alt': final_alt, 
                             'speed': final_speed,
                             'squawk': avion.get('squawk'),
-                            'flight': avion.get('flight', '').strip()
+                            'flight': avion.get('flight', '').strip(),
+                            'categoria': avion.get('category'),
+                            'registration': avion.get('r'),
+                            'type': avion.get('t')
+
+                            # Pendiente xd: obtener registration y type
                         }
                 
                 cache_json_data = temp_cache
@@ -152,6 +159,24 @@ def limpiar_inactivos(cursor):
     except Exception as e:
         pass # Silencioso para no ensuciar consola
 
+def determinar_tipo_aeronave(categoria, callsign):
+    if not callsign: callsign = ""
+    else: callsign = callsign.strip().upper()
+
+    # 1. Por Categoría ADS-B (Viene del JSON)
+    if categoria == 'A7': return 'HELICOPTERO'
+    elif categoria == 'A1': return 'LIGERO'
+
+    # 2. Por Indicativo Militar/Gobierno
+    if callsign.startswith(('FAM', 'ANX', 'GN', 'SDN', 'PFP', 'XAM', 'XBN')):
+        return 'MILITAR'
+    
+    # 3. Por Indicativo de Carga (MAS, AeroUnion, FedEx, UPS, ABX, etc.)
+    if callsign.startswith(('MAS', 'UCG', 'LCO', 'CKS', 'ABX', 'TPA', 'FDX', 'UPS')):
+        return 'CARGO'
+
+    return 'COMERCIAL'
+
 def main():
     threading.Thread(target=worker_actualizar_json, daemon=True).start()
     print("🌍 Monitor Iniciado con ANTI-REBOTE (Delay 4s)")
@@ -201,6 +226,11 @@ def main():
                 speed = json_info.get('speed')
                 squawk = json_info.get('squawk') or (fields[17].strip() if fields[17].strip() else None)
                 callsign = json_info.get('flight') or raw_callsign
+                matricula = json_info.get('registration')
+                modelo = json_info.get('type')
+
+                categoria_adsb = json_info.get('categoria')
+                tipo_aeronave = determinar_tipo_aeronave(categoria_adsb, callsign)
 
                 # --- CÁLCULO DE PISTA (CORRECCIÓN: SIEMPRE CALCULAR AQUÍ) ---
                 pista_actual = identificar_pista(lat, lon)
@@ -253,7 +283,6 @@ def main():
                 # --- DB UPDATE ---
                 estado_final = avion['estado_logico']
                 
-                # Ahora 'pista_actual' ya está definida arriba, así que no fallará
                 if lat is not None:
                     query = """
                     MERGE dbo.EstadoAeropuerto AS target
@@ -264,17 +293,20 @@ def main():
                             Estado = ?,
                             Latitud = ?, Longitud = ?, Rumbo = ?, Velocidad = ?, Altitud = ?, Squawk = ?,
                             PistaProbable = COALESCE(?, target.PistaProbable),
+                            TipoAeronave = ?,
+                            Matricula = COALESCE(?, target.Matricula), -- NUEVO
+                            Modelo = COALESCE(?, target.Modelo),       -- NUEVO
                             HoraAterrizaje = CASE WHEN ? = 'EN_TIERRA' AND target.Estado <> 'EN_TIERRA' THEN GETDATE() ELSE target.HoraAterrizaje END,
                             HoraDespegue = CASE WHEN ? = 'EN_VUELO' AND target.Estado = 'EN_TIERRA' THEN GETDATE() ELSE target.HoraDespegue END,
                             UltimaActualizacion = GETDATE()
                     WHEN NOT MATCHED THEN
-                        INSERT (HexIdent, Callsign, Estado, Latitud, Longitud, Rumbo, Velocidad, Altitud, Squawk, PistaProbable, HoraAterrizaje)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? = 'EN_TIERRA' THEN GETDATE() ELSE NULL END);
+                        INSERT (HexIdent, Callsign, Estado, Latitud, Longitud, Rumbo, Velocidad, Altitud, Squawk, PistaProbable, TipoAeronave, Matricula, Modelo, HoraAterrizaje)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? = 'EN_TIERRA' THEN GETDATE() ELSE NULL END);
                     """
                     cursor.execute(query, (
                         hex_id, 
-                        callsign, estado_final, lat, lon, track, speed, alt, squawk, pista_actual, estado_final, estado_final,
-                        hex_id, callsign, estado_final, lat, lon, track, speed, alt, squawk, pista_actual, estado_final
+                        callsign, estado_final, lat, lon, track, speed, alt, squawk, pista_actual, tipo_aeronave, matricula, modelo, estado_final, estado_final,
+                        hex_id, callsign, estado_final, lat, lon, track, speed, alt, squawk, pista_actual, tipo_aeronave, matricula, modelo, estado_final
                     ))
                     conn.commit()
 
