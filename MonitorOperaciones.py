@@ -21,7 +21,7 @@ HOST_SBS = 'localhost'
 PORT_SBS = 30003
 URL_JSON = "http://172.17.18.238/tar1090/data/aircraft.json" 
 
-TIEMPO_EXPIRACION = 60  
+TIEMPO_EXPIRACION = 20  
 TIEMPO_CONFIRMACION = 4
 
 # --- PISTAS ---
@@ -118,10 +118,14 @@ def analizar_squawk(squawk, hex_id):
 def determinar_tipo_aeronave(categoria, callsign):
     if not callsign: callsign = ""
     else: callsign = callsign.strip().upper()
+    
     if categoria == 'A7': return 'HELICOPTERO'
-    elif categoria == 'A1': return 'LIGERO'
     if callsign.startswith(('FAM', 'ANX', 'GN', 'SDN', 'PFP', 'XAM', 'XBN')): return 'MILITAR'
     if callsign.startswith(('MAS', 'UCG', 'LCO', 'CKS', 'ABX', 'TPA', 'FDX', 'UPS')): return 'CARGO'
+    elif categoria == 'A1': return 'LIGERO'
+    if not callsign and not categoria:
+        return 'DESCONOCIDO'
+        
     return 'COMERCIAL'
 
 def main():
@@ -140,8 +144,12 @@ def main():
             if ahora_ts - ultima_limpieza > 60:
                 try:
                     cursor.execute(f"DELETE FROM dbo.EstadoAeropuerto WHERE DATEDIFF(second, UltimaActualizacion, GETDATE()) > {TIEMPO_EXPIRACION}")
-                    cursor.commit()
-                except: pass
+                    conn.commit() # Asegúrate de usar conn.commit() o cursor.commit() de forma consistente
+                except Exception as e: 
+                    if '08S01' in str(e):
+                        logging.warning("⚠️ Omitiendo limpieza de BD: Conexión caída.")
+                    else:
+                        logging.error(f"⚠️ Error en limpieza de BD: {e}")
                 
                 borrar_mem = [k for k, v in memoria_aviones.items() if (ahora_ts - v['last_seen']) > TIEMPO_EXPIRACION]
                 for k in borrar_mem: del memoria_aviones[k]
@@ -237,7 +245,7 @@ def main():
                                 avion['estado_logico'] = 'EN_TIERRA'
                                 logging.info(f"🛬 ATERRIZAJE: {callsign or hex_id} [Pista: {pista_actual or '?'}]")
                             else:
-                                if (alt and alt > 200) or (speed and speed > 100):
+                                if (alt and alt > 200) and (speed and speed > 100):
                                     avion['estado_logico'] = 'EN_VUELO'
                                     logging.info(f"🛫 DESPEGUE: {callsign or hex_id} [Pista: {pista_actual or '?'}]")
                                 else:
@@ -255,7 +263,11 @@ def main():
                 
                 estado_final = avion['estado_logico']
                 
-                # --- ACTUALIZAR BASE DE DATOS (Ya no filtramos por Latitud) ---
+                if lat is None and lon is None and not callsign:
+                    estado_final = 'DESCONOCIDO'
+                    tipo_aeronave = 'DESCONOCIDO'
+
+                # --- ACTUALIZAR BASE DE DATOS ---
                 query = """
                 MERGE dbo.EstadoAeropuerto AS target
                 USING (SELECT ? AS Hex) AS source ON (target.HexIdent = source.Hex)
@@ -278,7 +290,35 @@ def main():
                     ))
                     conn.commit()
                 except Exception as e:
-                    logging.error(f"Error DB en Hex {hex_id}: {e}")
+                    error_msg = str(e)
+                    logging.error(f"Error DB en Hex {hex_id}: {error_msg}")
+                    
+                    # Detectar pérdida de conexión (FreeTDS 08S01)
+                    if '08S01' in error_msg or 'Communication link failure' in error_msg:
+                        logging.warning("🔄 Conexión a SQL Server perdida. Intentando reconectar...")
+                        
+                        # 1. Cerrar la conexión muerta (por si acaso)
+                        try:
+                            conn.close()
+                        except:
+                            pass
+                        
+                        # 2. Pausa breve para dejar que la red se estabilice
+                        time.sleep(3) 
+                        
+                        # 3. Intentar reconectar
+                        try:
+                            conn = get_db_connection()
+                            cursor = conn.cursor()
+                            logging.info("✅ Reconexión a SQL Server exitosa.")
+                        except Exception as conn_err:
+                            logging.error(f"❌ Fallo crítico al reconectar: {conn_err}")
+                        
+                        # 4. ROMPER EL BUCLE 'FOR'
+                        # Salimos de la iteración de aviones actuales. Evita el spam de logs.
+                        # El 'while True' principal volverá a empezar, descargará el JSON fresco 
+                        # y retomará el trabajo normalmente.
+                        break
 
             # Latencia del ciclo principal
             time.sleep(1)
